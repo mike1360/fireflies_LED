@@ -3,6 +3,7 @@
 #include <ESPAsyncWebServer.h>
 #include <FastLED.h>
 #include <math.h>
+#include <Preferences.h>
 
 // --------- USER CONFIG ----------
 #define LED_PIN       5
@@ -17,6 +18,14 @@ const char* WIFI_PASS = "princesselizabeth";
 
 CRGB leds[NUM_LEDS];
 AsyncWebServer server(80);
+
+// ---- Wi-Fi state / storage ----
+Preferences prefs;
+String savedSsid = "";
+String savedPass = "";
+bool inApMode = false;
+const char* AP_SSID = "Fireflies-Setup";
+const char* AP_PASS = ""; // open AP
 
 // runtime params
 uint8_t gBrightness = 80;
@@ -172,6 +181,7 @@ input[type=range]{accent-color:var(--acc)}
 .small{font-size:.9em;color:var(--muted)}
 </style></head><body><div class=wrap>
 <h2>Fireflies Controller</h2>
+<div id="apBanner" class="hint" style="display:none">AP mode: connect your phone to <b>Fireflies-Setup</b> and open <b>http://192.168.4.1/wifi</b> to join a network.</div>
 <div class=card>
   <label>Mode
     <select id=mode>
@@ -235,6 +245,15 @@ input[type=range]{accent-color:var(--acc)}
 
   <button class=btn id=rippleBtn>Create Ripple</button>
   <div class=hint>Triggers an expanding wave overlay on top of the current mode.</div>
+
+  <div class=card style="margin-top:16px">
+    <h3 style="margin:0 0 8px">Wi-Fi</h3>
+    <div class=hint>Moving to a new network? Open Wi-Fi setup to enter SSID &amp; password. If the device can't join Wi-Fi at boot, it starts its own <b>Fireflies-Setup</b> hotspot at <b>http://192.168.4.1</b>.</div>
+    <div class=row>
+      <a class="btn secondary" href="/wifi">Open Wi-Fi Setup</a>
+      <a class="btn secondary" href="/wifi_setup">Start Setup Hotspot</a>
+    </div>
+  </div>
 </div>
 
 <div class=card>
@@ -266,10 +285,16 @@ input[type=range]{accent-color:var(--acc)}
   <div class="footer small">The schedule loops continuously on the device until you clear or send a new one.</div>
 </div>
 
+</script>
 <script>
 // ----- Helpers -----
 const qs=id=>document.getElementById(id);
 const state={};
+
+fetch('/whoami').then(r=>r.json()).then(j=>{
+  const b=document.getElementById('apBanner'); if(!b) return;
+  if(j && j.ap){ b.style.display='block'; }
+}).catch(()=>{});
 
 function upd(){
   qs('vbright').textContent=qs('bright').value;
@@ -342,18 +367,68 @@ qs('sendSched').addEventListener('click', ()=>{
 </div></body></html>
 )HTML";
 
-void setupWiFi(){
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);  // <- corrected names
-  Serial.begin(115200);
-  Serial.print("WiFi…");
-  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+void startAP(){
+  inApMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  IPAddress ip = WiFi.softAPIP();
   Serial.println();
-  Serial.print("IP: "); Serial.println(WiFi.localIP());
+  Serial.print("AP mode. Connect to "); Serial.print(AP_SSID);
+  Serial.print(" then visit http://"); Serial.println(ip);
+}
+
+bool tryConnectSTA(const char* ssid, const char* pass, uint32_t timeoutMs){
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Serial.print("WiFi connect to '"); Serial.print(ssid); Serial.print("' ");
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(300); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
+    inApMode = false;
+    return true;
+  }
+  Serial.println();
+  Serial.println("WiFi connect timeout.");
+  return false;
+}
+
+void setupWiFi(){
+  Serial.begin(115200);
+  delay(50);
+
+  // Load saved creds (if any)
+  prefs.begin("wifi", false);
+  savedSsid = prefs.getString("ssid", "");
+  savedPass = prefs.getString("pass", "");
+  prefs.end();
+
+  // Try saved creds first, else compile-time defaults
+  bool ok = false;
+  if (savedSsid.length() > 0) {
+    ok = tryConnectSTA(savedSsid.c_str(), savedPass.c_str(), 10000);
+  }
+  if (!ok) {
+    ok = tryConnectSTA(WIFI_SSID, WIFI_PASS, 10000);
+    if (ok) {
+      // store them for next time
+      prefs.begin("wifi", false);
+      prefs.putString("ssid", WIFI_SSID);
+      prefs.putString("pass", WIFI_PASS);
+      prefs.end();
+      savedSsid = WIFI_SSID; savedPass = WIFI_PASS;
+    }
+  }
+  if (!ok) {
+    startAP();
+  }
 }
 
 void setupWeb(){
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200,"text/html",HTML); });
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200,"text/html; charset=utf-8",HTML); });
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest* req){
     if(req->hasParam("mode"))    gMode = req->getParam("mode")->value().toInt();
     if(req->hasParam("bright"))  gBrightness = req->getParam("bright")->value().toInt();
@@ -367,6 +442,47 @@ void setupWeb(){
     req->send(200,"text/plain","ok");
   });
   server.on("/ripple", HTTP_GET, [](AsyncWebServerRequest* r){ triggerRipple(); r->send(200,"text/plain","rip"); });
+
+  // UI can detect AP mode
+  server.on("/whoami", HTTP_GET, [](AsyncWebServerRequest* r){
+    String j = String("{\"ap\":") + (inApMode ? "true" : "false") + "}";
+    r->send(200, "application/json", j);
+  });
+
+  // Simple Wi-Fi config page
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* r){
+    String page = F("<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'><title>Wi-Fi Setup</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;padding:18px}input,button{font-size:16px;padding:10px;margin:6px 0;width:100%}label{display:block;margin-top:10px}</style></head><body>");
+    page += F("<h2>Fireflies Wi-Fi Setup</h2>");
+    page += F("<form method='POST' action='/wifi_save'>");
+    page += F("<label>SSID</label><input name='ssid' placeholder='Network name' value='");
+    page += savedSsid; page += F("'>");
+    page += F("<label>Password</label><input name='pass' type='password' placeholder='Password' value='");
+    page += savedPass; page += F("'>");
+    page += F("<button type='submit'>Save &amp; Reboot</button></form>");
+    page += F("<p style='opacity:.7'>Device will reboot and try to join the network you entered.</p>");
+    page += F("</body></html>");
+    r->send(200, "text/html; charset=utf-8", page);
+  });
+
+  // Save Wi‑Fi creds and reboot
+  server.on("/wifi_save", HTTP_POST, [](AsyncWebServerRequest* req){
+    String ssid = req->getParam("ssid", true)->value();
+    String pass = req->getParam("pass", true)->value();
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", ssid);
+    prefs.putString("pass", pass);
+    prefs.end();
+    savedSsid = ssid; savedPass = pass;
+    req->send(200, "text/html", "<meta http-equiv='refresh' content='2;url=/' /><h3>Saved. Rebooting…</h3>");
+    delay(500);
+    ESP.restart();
+  });
+
+  // Force AP setup mode
+  server.on("/wifi_setup", HTTP_GET, [](AsyncWebServerRequest* r){
+    startAP();
+    r->send(200, "text/plain", "AP started. Connect to 'Fireflies-Setup' and open http://192.168.4.1/wifi");
+  });
 
   // Receive schedule as JSON: {"items":[{"mode":0,"minutes":5}, ...]}
   server.on("/schedule", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL,

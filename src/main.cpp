@@ -27,6 +27,58 @@ bool inApMode = false;
 const char* AP_SSID = "Fireflies-Setup";
 const char* AP_PASS = ""; // open AP
 
+// Multiple saved networks
+struct WifiCred { String ssid; String pass; };
+#define MAX_WIFI_NETS 10
+WifiCred gNets[MAX_WIFI_NETS];
+int gNetCount = 0;
+
+void loadWifiList(){
+  gNetCount = 0;
+  prefs.begin("wifi", false);
+  int n = prefs.getInt("n", 0);
+  for (int i=0; i<n && i<MAX_WIFI_NETS; i++){
+    String s = prefs.getString(("s"+String(i)).c_str(), "");
+    String p = prefs.getString(("p"+String(i)).c_str(), "");
+    if (s.length()>0) gNets[gNetCount++] = {s,p};
+  }
+  // Backward compat: migrate single ssid/pass if present
+  if (gNetCount==0){
+    String s = prefs.getString("ssid", "");
+    String p = prefs.getString("pass", "");
+    if (s.length()>0){
+      gNets[gNetCount++] = {s,p};
+      prefs.putInt("n", gNetCount);
+      prefs.putString("s0", s);
+      prefs.putString("p0", p);
+    }
+  }
+  prefs.end();
+}
+void saveWifiList(){
+  prefs.begin("wifi", false);
+  prefs.putInt("n", gNetCount);
+  for (int i=0;i<gNetCount;i++){
+    prefs.putString(("s"+String(i)).c_str(), gNets[i].ssid);
+    prefs.putString(("p"+String(i)).c_str(), gNets[i].pass);
+  }
+  prefs.end();
+}
+bool addWifi(const String& s, const String& p){
+  if (s.length()==0 || gNetCount>=MAX_WIFI_NETS) return false;
+  for (int i=0;i<gNetCount;i++){ if (gNets[i].ssid==s){ gNets[i].pass=p; saveWifiList(); return true; } }
+  gNets[gNetCount++] = {s,p};
+  saveWifiList();
+  return true;
+}
+bool delWifi(int idx){
+  if (idx<0 || idx>=gNetCount) return false;
+  for (int i=idx;i<gNetCount-1;i++) gNets[i]=gNets[i+1];
+  gNetCount--;
+  saveWifiList();
+  return true;
+}
+
 // runtime params
 uint8_t gBrightness = 80;
 uint8_t gMode = 0;      // 0=Fireflies 1=Sync 2=Wave 3=Twinkle 4=Swarm 5=Ripples
@@ -248,17 +300,35 @@ input[type=range]{accent-color:var(--acc)}
 
   <div class=card style="margin-top:16px">
     <h3 style="margin:0 0 8px">Wi-Fi</h3>
-    <div class=hint>Moving to a new network? Open Wi-Fi setup to enter SSID &amp; password. If the device can't join Wi-Fi at boot, it starts its own <b>Fireflies-Setup</b> hotspot at <b>http://192.168.4.1</b>.</div>
+    <div class=hint>Save the networks you use. The device will try them at boot, in the order listed below.</div>
+
+    <ul id="wifiList" class="sched-list" style="margin-top:8px"></ul>
+
     <div class=row>
-      <a class="btn secondary" href="/wifi">Open Wi-Fi Setup</a>
+      <div>
+        <label>SSID</label>
+        <input id="nwSsid" placeholder="Network name">
+      </div>
+      <div>
+        <label>Password</label>
+        <input id="nwPass" type="password" placeholder="Password">
+      </div>
+    </div>
+    <div class=row>
+      <button class="btn secondary" id="addNet">Add network</button>
       <a class="btn secondary" href="/wifi_setup">Start Setup Hotspot</a>
     </div>
+    <div class=row>
+      <a class="btn secondary" href="/wifi">Open Wi-Fi Setup</a>
+      <button class="btn" id="tryNets">Try saved networks now</button>
+    </div>
+    <div class="small" id="wifiMsg" style="margin-top:6px;opacity:.85"></div>
   </div>
 </div>
 
 <div class=card>
   <h2 style="margin-top:0">Scheduler</h2>
-  <div class=hint>Build a simple timeline: choose a mode, set minutes, press <b>Add</b>. Drag to reorder. Press <b>Send to ESP32</b> to start looping.</div>
+  <div class=hint>Build a simple timeline: choose a mode, set duration, press <b>Add</b>. Drag to reorder. Press <b>Send to ESP32</b> to start looping.</div>
   <div class=row>
     <div>
       <label>Mode</label>
@@ -272,8 +342,12 @@ input[type=range]{accent-color:var(--acc)}
       </select>
     </div>
     <div>
-      <label>Duration (minutes)</label>
-      <input type=number id=schMin min=1 max=180 value=5 style="width:100%">
+      <label>Duration</label>
+      <div class=row>
+        <input type=number id=schMin min=0 max=180 value=0 style="width:100%" placeholder="min">
+        <input type=number id=schSec min=0 max=59 value=10 style="width:100%" placeholder="sec">
+      </div>
+      <div class="small" style="opacity:.8">Minutes and seconds (0–180 min, 0–59 sec).</div>
     </div>
   </div>
   <div class=row>
@@ -285,7 +359,6 @@ input[type=range]{accent-color:var(--acc)}
   <div class="footer small">The schedule loops continuously on the device until you clear or send a new one.</div>
 </div>
 
-</script>
 <script>
 // ----- Helpers -----
 const qs=id=>document.getElementById(id);
@@ -333,9 +406,10 @@ function renderSchedule(items){
     li.className='sched-item';
     li.draggable=true;
     li.dataset.idx=idx;
+    const mm = Math.floor(it.seconds/60), ss = it.seconds%60;
     li.innerHTML = '<div class=handle></div>'
       + '<div class=mode-badge>'+ modeName(it.mode) +'</div>'
-      + '<div class=small>'+ it.minutes +' min</div>'
+      + '<div class=small>'+ (mm>0?(mm+'m '):'') + ss + 's</div>'
       + '<button class="btn secondary" style="width:auto" onclick="removeItem('+idx+')">Remove</button>';
     li.addEventListener('dragstart', ev=>{ ev.dataTransfer.setData('text/plain', idx); });
     li.addEventListener('dragover', ev=>ev.preventDefault());
@@ -353,8 +427,12 @@ function modeName(m){ return ['Fireflies','Sync','Wave','Twinkle','Swarm','Rippl
 let schedule=[];
 
 qs('addItem').addEventListener('click', ()=>{
-  const m=+qs('schMode').value; const minutes=Math.max(1, Math.min(180, +qs('schMin').value||1));
-  schedule.push({mode:m, minutes:minutes});
+  const m = +qs('schMode').value;
+  const min = Math.max(0, Math.min(180, +qs('schMin').value||0));
+  const sec = Math.max(0, Math.min(59,  +qs('schSec').value||0));
+  let total = (min*60)+sec;
+  if (total < 1) total = 1; // minimum 1s
+  schedule.push({mode:m, seconds: total});
   renderSchedule(schedule);
 });
 window.removeItem=function(i){ schedule.splice(i,1); renderSchedule(schedule); };
@@ -363,6 +441,36 @@ qs('clearItems').addEventListener('click', ()=>{ schedule=[]; renderSchedule(sch
 qs('sendSched').addEventListener('click', ()=>{
   fetch('/schedule', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({items:schedule})});
 });
+
+// ----- Wi-Fi list management -----
+function refreshWifiList(){
+  fetch('/wifi_list').then(r=>r.json()).then(arr=>{
+    const ul=document.getElementById('wifiList'); ul.innerHTML='';
+    arr.forEach((item,i)=>{
+      const li=document.createElement('li');
+      li.className='sched-item';
+      li.innerHTML = '<div class="handle"></div>'
+        + '<div class="mode-badge">'+ item.ssid +'</div>'
+        + '<button class="btn secondary" style="width:auto" onclick="delNet('+i+')">Remove</button>';
+      ul.appendChild(li);
+    });
+  }).catch(()=>{});
+}
+function delNet(i){ fetch('/wifi_del?i='+i).then(()=>refreshWifiList()); }
+document.getElementById('addNet').addEventListener('click', ()=>{
+  const s=document.getElementById('nwSsid').value.trim();
+  const p=document.getElementById('nwPass').value;
+  if(!s){ document.getElementById('wifiMsg').textContent='Enter an SSID.'; return; }
+  fetch('/wifi_add', {method:'POST', body:new URLSearchParams({ssid:s, pass:p})})
+    .then(()=>{ document.getElementById('nwPass').value=''; refreshWifiList(); });
+});
+document.getElementById('tryNets').addEventListener('click', ()=>{
+  const msg=document.getElementById('wifiMsg'); msg.textContent='Trying saved networks…';
+  fetch('/wifi_try').then(r=>r.json()).then(j=>{
+    msg.textContent = j.connected ? 'Connected! Check the Serial Monitor for IP.' : 'No saved networks worked. AP may be active.';
+  }).catch(()=>{ msg.textContent='Error contacting device.'; });
+});
+refreshWifiList();
 </script>
 </div></body></html>
 )HTML";
@@ -400,35 +508,24 @@ void setupWiFi(){
   Serial.begin(115200);
   delay(50);
 
-  // Load saved creds (if any)
-  prefs.begin("wifi", false);
-  savedSsid = prefs.getString("ssid", "");
-  savedPass = prefs.getString("pass", "");
-  prefs.end();
+  loadWifiList();  // new: list of networks
 
-  // Try saved creds first, else compile-time defaults
   bool ok = false;
-  if (savedSsid.length() > 0) {
-    ok = tryConnectSTA(savedSsid.c_str(), savedPass.c_str(), 10000);
+  for (int i=0; i<gNetCount && !ok; i++){
+    ok = tryConnectSTA(gNets[i].ssid.c_str(), gNets[i].pass.c_str(), 10000);
   }
-  if (!ok) {
+
+  if (!ok && String(WIFI_SSID).length()>0){
     ok = tryConnectSTA(WIFI_SSID, WIFI_PASS, 10000);
-    if (ok) {
-      // store them for next time
-      prefs.begin("wifi", false);
-      prefs.putString("ssid", WIFI_SSID);
-      prefs.putString("pass", WIFI_PASS);
-      prefs.end();
-      savedSsid = WIFI_SSID; savedPass = WIFI_PASS;
-    }
+    if (ok){ addWifi(WIFI_SSID, WIFI_PASS); }
   }
-  if (!ok) {
-    startAP();
-  }
+
+  if (!ok) startAP();
 }
 
 void setupWeb(){
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* r){ r->send(200,"text/html; charset=utf-8",HTML); });
+
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest* req){
     if(req->hasParam("mode"))    gMode = req->getParam("mode")->value().toInt();
     if(req->hasParam("bright"))  gBrightness = req->getParam("bright")->value().toInt();
@@ -441,6 +538,7 @@ void setupWeb(){
     if(req->hasParam("drift"))   gAutoHueDrift = (req->getParam("drift")->value().toInt()!=0);
     req->send(200,"text/plain","ok");
   });
+
   server.on("/ripple", HTTP_GET, [](AsyncWebServerRequest* r){ triggerRipple(); r->send(200,"text/plain","rip"); });
 
   // UI can detect AP mode
@@ -449,7 +547,7 @@ void setupWeb(){
     r->send(200, "application/json", j);
   });
 
-  // Simple Wi-Fi config page
+  // Simple Wi-Fi config page (single entry)
   server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* r){
     String page = F("<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'><title>Wi-Fi Setup</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;padding:18px}input,button{font-size:16px;padding:10px;margin:6px 0;width:100%}label{display:block;margin-top:10px}</style></head><body>");
     page += F("<h2>Fireflies Wi-Fi Setup</h2>");
@@ -463,8 +561,6 @@ void setupWeb(){
     page += F("</body></html>");
     r->send(200, "text/html; charset=utf-8", page);
   });
-
-  // Save Wi‑Fi creds and reboot
   server.on("/wifi_save", HTTP_POST, [](AsyncWebServerRequest* req){
     String ssid = req->getParam("ssid", true)->value();
     String pass = req->getParam("pass", true)->value();
@@ -478,16 +574,36 @@ void setupWeb(){
     ESP.restart();
   });
 
-  // Force AP setup mode
-  server.on("/wifi_setup", HTTP_GET, [](AsyncWebServerRequest* r){
-    startAP();
-    r->send(200, "text/plain", "AP started. Connect to 'Fireflies-Setup' and open http://192.168.4.1/wifi");
+  // Saved networks management
+  server.on("/wifi_list", HTTP_GET, [](AsyncWebServerRequest* r){
+    String out="[";
+    for (int i=0;i<gNetCount;i++){ if(i) out+=","; out+="{\"ssid\":\""+gNets[i].ssid+"\"}"; }
+    out+="]";
+    r->send(200,"application/json",out);
+  });
+  server.on("/wifi_add", HTTP_POST, [](AsyncWebServerRequest* req){
+    String ssid = req->getParam("ssid", true)->value();
+    String pass = req->getParam("pass", true)->value();
+    bool ok = addWifi(ssid, pass);
+    req->send(200,"application/json", String("{\"ok\":")+(ok?"true":"false")+"}");
+  });
+  server.on("/wifi_del", HTTP_GET, [](AsyncWebServerRequest* req){
+    int idx = req->hasParam("i") ? req->getParam("i")->value().toInt() : -1;
+    bool ok = delWifi(idx);
+    req->send(200,"application/json", String("{\"ok\":")+(ok?"true":"false")+"}");
+  });
+  server.on("/wifi_try", HTTP_GET, [](AsyncWebServerRequest* r){
+    bool ok=false;
+    for (int i=0;i<gNetCount && !ok;i++){
+      ok = tryConnectSTA(gNets[i].ssid.c_str(), gNets[i].pass.c_str(), 7000);
+    }
+    if(!ok) startAP();
+    r->send(200,"application/json", String("{\"connected\":")+(ok?"true":"false")+"}");
   });
 
-  // Receive schedule as JSON: {"items":[{"mode":0,"minutes":5}, ...]}
+  // Receive schedule as JSON: {"items":[{"mode":0,"seconds":10}, ...]}
   server.on("/schedule", HTTP_POST, [](AsyncWebServerRequest* req){}, NULL,
-    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t index, size_t total){
-      // very small JSON parser: look for "mode" and "minutes" pairs
+    [](AsyncWebServerRequest* req, uint8_t* data, size_t len, size_t, size_t){
       gScheduleCount = 0;
       String body; body.reserve(len+1);
       for(size_t i=0;i<len;i++) body += (char)data[i];
@@ -499,13 +615,18 @@ void setupWeb(){
         int stop = (comma<0? endBrace : min(comma,endBrace));
         uint8_t mode = (uint8_t) body.substring(colon+1, stop).toInt();
 
-        int tPos = body.indexOf("\"minutes\"", stop); if(tPos<0) break;
+        // prefer "seconds", fallback to "minutes"
+        int tPos = body.indexOf("\"seconds\"", stop);
+        bool usedSeconds = true;
+        if (tPos < 0) { tPos = body.indexOf("\"minutes\"", stop); usedSeconds = false; }
+        if (tPos<0) break;
         int tColon = body.indexOf(':', tPos); if(tColon<0) break;
         int tComma = body.indexOf(',', tColon); int tEnd = body.indexOf('}', tColon);
         int tStop = (tComma<0? tEnd : min(tComma,tEnd));
-        uint32_t minutes = (uint32_t) body.substring(tColon+1, tStop).toInt();
+        uint32_t amount = (uint32_t) body.substring(tColon+1, tStop).toInt();
+        uint32_t durMs = usedSeconds ? (amount*1000UL) : (amount*60UL*1000UL);
 
-        gSchedule[gScheduleCount++] = { mode, minutes*60UL*1000UL };
+        gSchedule[gScheduleCount++] = { mode, durMs };
         pos = tStop;
       }
       gScheduleIndex = 0;
